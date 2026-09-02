@@ -1,0 +1,23 @@
+[package]
+name = "timekettle-kernel"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+authors.workspace = true
+description = "Workload player for the timekettle replay test harness: loads a recording, reconstructs incoming HTTP requests per correlation, drives a candidate Hyperswitch, and reports per-correlation response diffs."
+
+[dependencies]
+timekettle = { path = "../timekettle", default-features = false }
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+
+[dev-dependencies]
+tempfile = "3"
+
+[[bin]]
+name = "timekettle-kernel"
+path = "src/main.rs"
+
+[lints]
+workspace = true

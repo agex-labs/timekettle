@@ -1,0 +1,54 @@
+[package]
+description = "Facade crate for Timekettle record/replay: attribute-macro re-exports, payload helpers, and the runtime surface macro-generated code uses."
+name = "timekettle"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+authors.workspace = true
+
+[dependencies]
+timekettle-context = { path = "../timekettle-context" }
+timekettle-core = { path = "../timekettle-core" }
+timekettle-derive = { path = "../timekettle-derive" }
+timekettle-runtime = { path = "../timekettle-runtime" }
+serde = "1"
+serde_json = "1"
+# Optional: enables `codec::ResultCodec` + `db::recorded_output`, whose Value is
+# `Result<T, error_stack::Report<E>>`. Optional so the core facade stays
+# dependency-lean for consumers that don't use error-stack.
+error-stack = { version = "0.4", default-features = false, optional = true }
+# Optional: the diesel connection wrapper for wire-faithful DB row capture
+# (`TimekettleLoadConnection`). Optional so the facade stays diesel-free for
+# consumers that don't wrap a pg pool.
+timekettle-diesel = { path = "../timekettle-diesel", optional = true }
+# Optional client adapters for `value::RedisWireValue` (#45): the conversions
+# live next to the wire type (the orphan rule permits it — the target type is
+# ours), so capture and replay in a vendor call `.into()`/`.try_into()` instead
+# of maintaining a private twin enum coupled to ours by serde variant-name
+# agreement. Versions track hyperswitch's pins (fred 8.0.6 / redis 1.2.0);
+# the consumer's single lockfile keeps the client resolved once, so the
+# adapter and the vendor's own client are always the same crate version.
+# `default-features = false`: only the value-type layer is used here.
+fred = { version = "8.0.6", default-features = false, optional = true }
+redis = { version = "1.2.0", default-features = false, optional = true }
+
+[features]
+error-stack = ["dep:error-stack"]
+diesel-pg = ["dep:timekettle-diesel"]
+# `From<fred::types::RedisValue> for value::RedisWireValue` + `TryFrom` back.
+fred = ["dep:fred"]
+# `From<redis::Value> for value::RedisWireValue` + `TryFrom` back.
+redis-rs = ["dep:redis"]
+
+[dev-dependencies]
+serde_json = "1"
+tempfile = "3"
+error-stack = { version = "0.4", default-features = false }
+# Tests drive the runtime surface (hooks, dispatch, wire value types) directly.
+timekettle-runtime = { path = "../timekettle-runtime" }
+
+[lints.clippy]
+dbg_macro = "deny"
+todo = "deny"
+unwrap_used = "deny"

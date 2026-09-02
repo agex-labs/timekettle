@@ -1,0 +1,69 @@
+[package]
+name = "timekettle-orchestrator"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+authors.workspace = true
+description = "Orchestrator service for the timekettle replay test harness: run lifecycle, recording store, lookup-table rendering, post-hoc divergence detection."
+
+[dependencies]
+timekettle = { path = "../timekettle", default-features = false }
+# Wire types shared with the recording streams (`ExecutionGraphNode` rides the
+# tagged one-stream artifacts next to the boundary events).
+timekettle-core = { path = "../timekettle-core" }
+timekettle-forest = { path = "../timekettle-forest" }
+# Depended on for the shared wire types (`HttpDiff`, `JsonFieldDiff`) and the
+# `diff_json` helper the divergence detector reuses. The kernel lib is
+# dependency-light (timekettle + serde) and does not depend back on this crate, so
+# there is no cycle and no heavyweight transitive cost.
+timekettle-kernel = { path = "../timekettle-kernel" }
+timekettle-compactor = { path = "../timekettle-compactor" }
+timekettle-store = { path = "../timekettle-store" }
+sha2 = "0.10"
+hex = "0.4"
+rust-embed = "8"
+# Pure-Rust tar extraction for the runner's `stage-codebundle` step (the
+# migrations initContainer unpacks the candidate's CodeBundle tar). Self-
+# contained so the runner does not depend on a `tar` binary being in the image.
+tar = "0.4"
+# TOML with a value DOM (`toml::Table`), for layering the candidate's own router
+# config under the recorded one (`config_layer`). A table-aware merge is the
+# whole point: two `[connectors]` tables concatenated is a duplicate-key parse
+# error, so text splicing cannot do this job.
+toml = "0.8"
+# gunzip the source repo tarball (git-host codeload) when the control plane
+# produces a candidate's migration bundle straight from its ref — streamed, so
+# only the migrations/ subtree is held, not the whole repo.
+flate2 = "1"
+# Blocking HTTP for StoreCtx::Http — the in-Job runner reports progress from a
+# plain thread; a sync client avoids dragging a second runtime into the pod.
+# Also the executor's k8s API transport (raw REST against the in-cluster
+# apiserver); the CA trust root is loaded from the pod's mounted SA cert, which
+# needs rustls directly (versions pinned to ureq 2.12's own rustls 0.23).
+ureq = { version = "2", features = ["json"] }
+rustls = "0.23"
+rustls-pemfile = "2"
+mime_guess = "2"
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+axum = "0.8"
+tokio = { version = "1", features = ["rt-multi-thread", "macros", "signal", "time"] }
+tokio-stream = "0.1"
+async-stream = "0.3"
+
+[dev-dependencies]
+tempfile = "3"
+timekettle-context = { path = "../timekettle-context" }
+tower = { version = "0.5", features = ["util"] }
+
+[[bin]]
+name = "timekettle-orchestrator"
+path = "src/main.rs"
+
+[[bin]]
+name = "timekettle-runner"
+path = "src/bin/timekettle-runner.rs"
+
+[lints]
+workspace = true

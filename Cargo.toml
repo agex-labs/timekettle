@@ -1,0 +1,32 @@
+[workspace]
+members = [
+    "crates/timekettle",
+    "crates/timekettle-context",
+    "crates/timekettle-core",
+    "crates/timekettle-forest",
+    "crates/timekettle-derive",
+    "crates/timekettle-compactor",
+    "crates/timekettle-diesel",
+    "crates/timekettle-runtime",
+    "crates/timekettle-tui",
+    "crates/timekettle-kernel",
+    "crates/timekettle-orchestrator",
+    "crates/timekettle-store",
+]
+resolver = "2"
+
+[workspace.package]
+edition = "2021"
+rust-version = "1.85"
+license = "Apache-2.0 license"
+version = "0.1.0"
+authors = ["timekettle contributors"]
+repository = "https://github.com/agex-labs/timekettle.git"
+
+[workspace.lints.rust]
+unsafe_code = "forbid"
+
+[workspace.lints.clippy]
+dbg_macro = "deny"
+todo = "deny"
+unwrap_used = "deny"

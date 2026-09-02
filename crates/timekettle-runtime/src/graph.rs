@@ -1,0 +1,411 @@
+use std::collections::{BTreeMap, HashMap};
+use std::fmt;
+use std::panic::{catch_unwind, AssertUnwindSafe};
+use std::path::Path;
+use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::{Arc, Mutex, OnceLock};
+
+use timekettle_core::ExecutionGraphNode;
+use tracing::field::{Field, Visit};
+use tracing::span::{Attributes, Id, Record};
+use tracing::Subscriber;
+use tracing_subscriber::layer::{Context, Layer};
+use tracing_subscriber::registry::LookupSpan;
+
+use crate::{now_ns, TimekettleRecord};
+
+static GRAPH_NODE_BY_TRACING_SPAN_ID: OnceLock<Mutex<HashMap<u64, u64>>> = OnceLock::new();
+
+fn graph_node_map() -> &'static Mutex<HashMap<u64, u64>> {
+    GRAPH_NODE_BY_TRACING_SPAN_ID.get_or_init(|| Mutex::new(HashMap::new()))
+}
+
+/// Return the active tracing span id and matching execution-graph node id.
+///
+/// This is populated by [`ExecutionGraphLayer`]. When the graph layer is not installed,
+/// or the current span was not observed by the layer, both values may be absent.
+pub fn current_execution_graph_context() -> (Option<u64>, Option<u64>) {
+    let tracing_span_id = tracing::Span::current().id().map(|id| id.into_u64());
+    let graph_node_id = tracing_span_id.and_then(|id| {
+        graph_node_map()
+            .lock()
+            .ok()
+            .and_then(|map| map.get(&id).copied())
+    });
+    (tracing_span_id, graph_node_id)
+}
+
+/// Where tape-carried graph nodes land. Implemented by the record-mode
+/// [`crate::RecordingHook`] (nodes ride the recording tape next to boundary
+/// events) and the replay-mode [`crate::replay::LookupTableHook`] (nodes ride
+/// the observed stream). The sink owns the stream identity: it stamps
+/// `global_sequence` and `recording_run_id`; the layer leaves both unset.
+///
+/// There is deliberately no file-based sink: sandboxed deployments have no
+/// writable graph path, so graph capture uses the one data pipeline or
+/// nothing.
+pub trait GraphNodeSink: Send + Sync {
+    fn graph_node(&self, node: ExecutionGraphNode);
+}
+
+/// Tracing subscriber layer that records span lifecycle data as execution-graph
+/// nodes on the mode's record stream.
+pub struct ExecutionGraphLayer {
+    sink: Arc<dyn GraphNodeSink>,
+    node_ids: AtomicU64,
+    sequence: AtomicU64,
+}
+
+impl ExecutionGraphLayer {
+    /// Create a graph layer emitting through the given sink (the installed
+    /// runtime hook).
+    pub fn new(sink: Arc<dyn GraphNodeSink>) -> Self {
+        Self {
+            sink,
+            node_ids: AtomicU64::new(0),
+            sequence: AtomicU64::new(0),
+        }
+    }
+
+    fn next_node_id(&self) -> u64 {
+        self.node_ids.fetch_add(1, Ordering::SeqCst)
+    }
+
+    fn next_sequence(&self) -> u64 {
+        self.sequence.fetch_add(1, Ordering::SeqCst)
+    }
+}
+
+impl<S> Layer<S> for ExecutionGraphLayer
+where
+    S: Subscriber,
+    S: for<'lookup> LookupSpan<'lookup>,
+{
+    fn on_new_span(&self, attrs: &Attributes<'_>, id: &Id, ctx: Context<'_, S>) {
+        // Which correlation does this span NAME? Resolved before the gate,
+        // because the gate needs the answer — see below — and reused for the
+        // node's own correlation further down, so it is visited once.
+        let mut correlation_visitor = crate::correlation_layer::CorrelationVisitor(None);
+        let _ = catch_unwind(AssertUnwindSafe(|| {
+            attrs.record(&mut correlation_visitor);
+        }));
+        let own_correlation = correlation_visitor.0;
+
+        // Allocate nothing — no node id, no `graph_node_map` lock, no span
+        // extension — unless this call will be recorded or replayed. A recorder
+        // with the request sampled out allocates nothing beyond the visit above.
+        //
+        // TWO questions, in cost order, and the second one is load-bearing.
+        //
+        // The ambient question answers every span created *inside* a request
+        // scope, which is nearly all of them. It cannot answer the one span that
+        // matters most. A request's ROOT span is CREATED one instruction before
+        // `TimekettleCorrelationLayer::on_enter` engages the correlation it
+        // establishes (`router_env`'s ingress builds the span, then instruments
+        // the future with it), so at this point the thread has no correlation and
+        // the ambient gate says "no" for EVERY recorded request. The root then
+        // owns no `GraphSpanState`, its children find no parent state, and the
+        // record side silently loses its forest root — while the replay side
+        // keeps one, because `observation_active` is unconditionally true for
+        // `RuntimeMode::Replay`. Two forests that differ at the root cannot be
+        // aligned.
+        //
+        // So a span that NAMES its own correlation is answered on its own terms,
+        // against the correlation-keyed registry the ingress writes BEFORE
+        // creating the span, and which `TimekettleCorrelationLayer::on_new_span` already
+        // consults for the same decision. Same store, same owner, so the two
+        // layers cannot disagree about which spans belong to a sampled-in request.
+        //
+        // The POLARITY differs from that layer deliberately: it observes unless
+        // an explicit `Skip` says otherwise, because engaging a correlation
+        // records nothing. Allocating graph state does record, so this stays
+        // opt-in — an undecided correlation allocates nothing, exactly as
+        // `capture_verdict` treats it.
+        if !crate::observation_is_active()
+            && !own_correlation
+                .as_deref()
+                .is_some_and(crate::observation_is_active_for)
+        {
+            return;
+        }
+
+        let parent_id = graph_parent_id(attrs, &ctx);
+        let metadata = attrs.metadata();
+        let mut fields = BTreeMap::new();
+        // Contain a panic in a span field's Debug/Display impl: keep the fields
+        // captured before it and mark the node, so a misbehaving field truncates
+        // capture instead of killing the request.
+        if catch_unwind(AssertUnwindSafe(|| {
+            attrs.record(&mut JsonFieldVisitor::new(&mut fields));
+        }))
+        .is_err()
+        {
+            fields.insert(
+                "timekettle.field_capture_panicked".to_owned(),
+                serde_json::Value::Bool(true),
+            );
+        }
+
+        if let Some(span) = ctx.span(id) {
+            // The span's correlation, resolved from the visit above rather than
+            // read from anywhere else. Two nearer-looking sources are both wrong:
+            //
+            //  * `TimekettleCorrelationLayer`'s `SpanContext` extension does not exist
+            //    yet. `Layered::on_new_span` runs the inner layer first, and the
+            //    subscriber is built `.with(graph).with(correlation)`, so this
+            //    layer runs first. Reading that extension would yield `None` for
+            //    every node, and swapping the two `.with` calls would silently
+            //    "fix" it — correctness must not depend on registration order.
+            //
+            //  * `timekettle_context::current_correlation_id()` is engaged on ENTER,
+            //    not on new-span. At this point the ambient value is still the
+            //    parent's, so a request's ROOT span — the one that establishes
+            //    the correlation, and the one a scoped graph needs most — would
+            //    be attributed to whatever ran before it. (That is the same fact
+            //    the gate above turns on: it is why the ambient gate cannot
+            //    answer for a root, not merely why the ambient value cannot name
+            //    one.)
+            //
+            // A span's own `request_id` field is the source of truth; a span
+            // without one belongs to whatever its parent belongs to. That is the
+            // same rule `TimekettleCorrelationLayer` applies, over the same field
+            // constant and visitor, so the two layers cannot drift.
+            let correlation = own_correlation
+                .map(Arc::<str>::from)
+                .or_else(|| parent_correlation(attrs, &ctx));
+
+            let node_id = self.next_node_id();
+            if let Ok(mut map) = graph_node_map().lock() {
+                map.insert(id.into_u64(), node_id);
+            }
+
+            span.extensions_mut().insert(GraphSpanState {
+                node_id,
+                parent_id,
+                correlation,
+                causal_parent_ids: Vec::new(),
+                sequence: self.next_sequence(),
+                span_name: metadata.name().to_owned(),
+                target: metadata.target().to_owned(),
+                level: metadata.level().to_string(),
+                fields,
+                started_ns: now_ns(),
+            });
+        }
+    }
+
+    fn on_record(&self, id: &Id, values: &Record<'_>, ctx: Context<'_, S>) {
+        // Skip the span lookup when not recording or replaying (a span opened
+        // while inert carries no `GraphSpanState`, so the `get_mut` below would
+        // no-op anyway).
+        if !crate::observation_is_active() {
+            return;
+        }
+        if let Some(span) = ctx.span(id) {
+            if let Some(state) = span.extensions_mut().get_mut::<GraphSpanState>() {
+                // Same field-visitor firewall as `on_new_span`.
+                if catch_unwind(AssertUnwindSafe(|| {
+                    values.record(&mut JsonFieldVisitor::new(&mut state.fields));
+                }))
+                .is_err()
+                {
+                    state.fields.insert(
+                        "timekettle.field_capture_panicked".to_owned(),
+                        serde_json::Value::Bool(true),
+                    );
+                }
+            }
+        }
+    }
+
+    fn on_follows_from(&self, id: &Id, follows: &Id, ctx: Context<'_, S>) {
+        let Some(causal_parent_id) = ctx.span(follows).and_then(|span| {
+            span.extensions()
+                .get::<GraphSpanState>()
+                .map(|state| state.node_id)
+        }) else {
+            return;
+        };
+
+        if let Some(span) = ctx.span(id) {
+            if let Some(state) = span.extensions_mut().get_mut::<GraphSpanState>() {
+                if !state.causal_parent_ids.contains(&causal_parent_id) {
+                    state.causal_parent_ids.push(causal_parent_id);
+                }
+            }
+        }
+    }
+
+    fn on_close(&self, id: Id, ctx: Context<'_, S>) {
+        // Not gated on `observation_is_active()`: close must match open. A span
+        // opened while observing owns a `GraphSpanState` and a `graph_node_map`
+        // entry; if it closes after its correlation scope has exited (an async span
+        // held across an await) the flag can read false by now, and gating here
+        // would leak the map entry and drop the node. The `remove`-None early
+        // return is the real gate — a span that allocated nothing returns before
+        // the `graph_node_map` lock.
+        let Some(span) = ctx.span(&id) else {
+            return;
+        };
+        let Some(state) = span.extensions_mut().remove::<GraphSpanState>() else {
+            return;
+        };
+        if let Ok(mut map) = graph_node_map().lock() {
+            map.remove(&id.into_u64());
+        }
+
+        let closed_ns = now_ns().max(state.started_ns);
+        self.sink.graph_node(state.into_node(Some(closed_ns)));
+    }
+}
+
+fn graph_parent_id<S>(attrs: &Attributes<'_>, ctx: &Context<'_, S>) -> Option<u64>
+where
+    S: Subscriber,
+    S: for<'lookup> LookupSpan<'lookup>,
+{
+    attrs
+        .parent()
+        .and_then(|parent| node_id_for_span(parent, ctx))
+        .or_else(|| {
+            attrs
+                .is_contextual()
+                .then(|| {
+                    ctx.current_span()
+                        .id()
+                        .and_then(|id| node_id_for_span(id, ctx))
+                })
+                .flatten()
+        })
+}
+
+/// The correlation of the span this one hangs under, resolved over the same
+/// parent the node's `parent_id` uses so a node's correlation and its place in
+/// the tree can never come from different ancestors.
+fn parent_correlation<S>(attrs: &Attributes<'_>, ctx: &Context<'_, S>) -> Option<Arc<str>>
+where
+    S: Subscriber,
+    S: for<'lookup> LookupSpan<'lookup>,
+{
+    let correlation_of = |id: &Id| -> Option<Arc<str>> {
+        ctx.span(id).and_then(|span| {
+            span.extensions()
+                .get::<GraphSpanState>()
+                .and_then(|state| state.correlation.clone())
+        })
+    };
+    attrs.parent().and_then(&correlation_of).or_else(|| {
+        attrs
+            .is_contextual()
+            .then(|| ctx.current_span().id().and_then(&correlation_of))
+            .flatten()
+    })
+}
+
+fn node_id_for_span<S>(id: &Id, ctx: &Context<'_, S>) -> Option<u64>
+where
+    S: Subscriber,
+    S: for<'lookup> LookupSpan<'lookup>,
+{
+    ctx.span(id).and_then(|span| {
+        span.extensions()
+            .get::<GraphSpanState>()
+            .map(|state| state.node_id)
+    })
+}
+
+/// Read the execution-graph nodes carried on an artifact directory's record
+/// stream (`semantic-events.jsonl`), in stream order.
+pub fn read_execution_graph_records(
+    artifact_dir: &Path,
+) -> std::io::Result<Vec<ExecutionGraphNode>> {
+    let content = std::fs::read_to_string(artifact_dir.join("semantic-events.jsonl"))?;
+    let mut nodes = Vec::new();
+    for line in content.lines() {
+        if line.trim().is_empty() {
+            continue;
+        }
+        if let Ok(TimekettleRecord::GraphNode(node)) = serde_json::from_str::<TimekettleRecord>(line) {
+            nodes.push(*node);
+        }
+    }
+    Ok(nodes)
+}
+
+#[derive(Debug)]
+struct GraphSpanState {
+    node_id: u64,
+    parent_id: Option<u64>,
+    /// This span's request, from its own `request_id` field or inherited from
+    /// the parent. `None` for ambient spans that belong to no request.
+    correlation: Option<Arc<str>>,
+    causal_parent_ids: Vec<u64>,
+    sequence: u64,
+    span_name: String,
+    target: String,
+    level: String,
+    fields: BTreeMap<String, serde_json::Value>,
+    started_ns: u64,
+}
+
+impl GraphSpanState {
+    fn into_node(self, closed_ns: Option<u64>) -> ExecutionGraphNode {
+        ExecutionGraphNode {
+            node_id: self.node_id,
+            // Stream identity (global_sequence, recording_run_id) is stamped
+            // by the GraphNodeSink that owns the stream.
+            global_sequence: 0,
+            parent_id: self.parent_id,
+            causal_parent_ids: self.causal_parent_ids,
+            sequence: self.sequence,
+            correlation_id: self.correlation.as_deref().map(str::to_owned),
+            recording_run_id: None,
+            span_name: self.span_name,
+            target: self.target,
+            level: self.level,
+            fields: self.fields,
+            started_ns: self.started_ns,
+            closed_ns,
+        }
+    }
+}
+
+struct JsonFieldVisitor<'a> {
+    fields: &'a mut BTreeMap<String, serde_json::Value>,
+}
+
+impl<'a> JsonFieldVisitor<'a> {
+    fn new(fields: &'a mut BTreeMap<String, serde_json::Value>) -> Self {
+        Self { fields }
+    }
+
+    fn insert(&mut self, field: &Field, value: serde_json::Value) {
+        self.fields.insert(field.name().to_owned(), value);
+    }
+}
+
+impl Visit for JsonFieldVisitor<'_> {
+    fn record_bool(&mut self, field: &Field, value: bool) {
+        self.insert(field, serde_json::Value::Bool(value));
+    }
+
+    fn record_i64(&mut self, field: &Field, value: i64) {
+        self.insert(field, serde_json::Value::from(value));
+    }
+
+    fn record_u64(&mut self, field: &Field, value: u64) {
+        self.insert(field, serde_json::Value::from(value));
+    }
+
+    fn record_str(&mut self, field: &Field, value: &str) {
+        self.insert(field, serde_json::Value::String(value.to_owned()));
+    }
+
+    fn record_error(&mut self, field: &Field, value: &(dyn std::error::Error + 'static)) {
+        self.insert(field, serde_json::Value::String(value.to_string()));
+    }
+
+    fn record_debug(&mut self, field: &Field, value: &dyn fmt::Debug) {
+        self.insert(field, serde_json::Value::String(format!("{value:?}")));
+    }
+}
